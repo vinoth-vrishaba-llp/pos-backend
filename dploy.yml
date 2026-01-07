@@ -1,0 +1,14 @@
+environments:
+  dev:
+    deploy_directory: /home/aanyas/htdocs/pos-backend.aanyasri.com
+    branch: main
+
+    before_commands:
+      - npm install --omit=dev
+
+    after_commands:
+      - pm2 delete pos-backend 2>/dev/null || true
+      - pm2 start index.js --name pos-backend
+      - pm2 save
+
+    keep_releases: 5
