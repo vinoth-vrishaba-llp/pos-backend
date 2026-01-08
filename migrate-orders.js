@@ -56,6 +56,8 @@ async function migrateOrders() {
           // Re-normalize with correct mapping
           const normalized = normalizeOrderForBaserow(wooOrder);
 
+          console.log(`   📅 Timestamps - Created: ${normalized.created_at}, Updated: ${normalized.updated_at}`);
+
           // Update in Baserow
           const result = await base.upsertOrder(normalized);
 
@@ -173,8 +175,8 @@ async function validateOrders() {
           issues.missing_woo_id.push(order.order_number);
         }
 
-        // Check status
-        const validStatuses = ["paid", "completed", "cancelled"];
+        // Check status - ✅ UPDATED: Added "refund"
+        const validStatuses = ["paid", "completed", "cancelled", "refund"];
         if (!validStatuses.includes(order.status)) {
           issues.invalid_status.push({
             order: order.order_number,

@@ -3,6 +3,7 @@
 /**
  * Build WooCommerce Order Payload from POS Cart
  * ✅ UPDATED: Properly formats FMS components to match WordPress plugin expectations
+ * ✅ FIXED: Removed created_at to let WooCommerce handle timestamps
  */
 export function buildWooOrderPayload(cartData) {
   const {
@@ -147,6 +148,7 @@ export function buildWooOrderPayload(cartData) {
     shipping_lines,
     customer_note: notes || "",
     meta_data,
+    // ❌ REMOVED: created_at - WooCommerce handles this automatically with correct timezone
   };
 
   return payload;
@@ -170,6 +172,7 @@ function getPaymentMethodTitle(method) {
 /**
  * Normalize WooCommerce order response for Baserow
  * ✅ Does NOT sync _hr_fms_components to Baserow
+ * ✅ FIXED: Uses WooCommerce timestamps directly (preserves timezone)
  */
 export function normalizeOrderForBaserow(wooOrder) {
   // Extract coupon info
@@ -205,8 +208,13 @@ export function normalizeOrderForBaserow(wooOrder) {
     notes: wooOrder.customer_note || "",
     measurements: getMeta("measurements") || "-",
     items: JSON.stringify(normalizeLineItems(wooOrder.line_items)), // ✅ Clean items
-    created_at: wooOrder.date_created,
-    updated_at: wooOrder.date_modified,
+    
+    // ✅ FIXED: Use GMT timestamps with 'Z' suffix so Baserow knows it's UTC
+    // Baserow will then convert to user's timezone correctly
+    created_at: wooOrder.date_created_gmt ? `${wooOrder.date_created_gmt}Z` : wooOrder.date_created,
+    updated_at: wooOrder.date_modified_gmt 
+      ? `${wooOrder.date_modified_gmt}Z` 
+      : (wooOrder.date_created_gmt ? `${wooOrder.date_created_gmt}Z` : wooOrder.date_created),
     
     // Discount fields
     discount_type: discountType,
@@ -233,7 +241,7 @@ function mapStatus(wooStatus) {
     "on-hold": "paid",
     "completed": "completed",
     "cancelled": "cancelled",
-    "refunded": "cancelled",
+    "refunded": "refund",      // ✅ FIXED: Map to "refund" instead of "cancelled"
     "failed": "cancelled",
   };
   return STATUS_MAP[wooStatus] || "paid";

@@ -114,6 +114,7 @@ export async function patchOrderStatus(wooOrderId, status) {
     const STATUS_MAP = {
       completed: "completed",
       cancelled: "cancelled",
+      refunded: "refund",        // ✅ ADDED: Support refund status
       processing: "paid",
       pending: "paid",
       "on-hold": "paid",
@@ -140,10 +141,10 @@ export async function patchOrderStatus(wooOrderId, status) {
   }
 }
 
-/* =========================
-   VALIDATION & SANITIZATION
-========================= */
-
+/**
+ * Validate order schema
+ * ✅ UPDATED: Added "refund" to valid statuses
+ */
 function validateOrderSchema(order) {
   const required = ["woo_order_id", "order_number", "status", "total"];
   const missing = required.filter(field => !order[field]);
@@ -152,14 +153,14 @@ function validateOrderSchema(order) {
     throw new Error(`Missing required fields: ${missing.join(", ")}`);
   }
 
-  const validStatuses = ["paid", "completed", "cancelled"];
+  const validStatuses = ["paid", "completed", "cancelled", "refund"]; // ✅ ADDED: "refund"
   if (!validStatuses.includes(order.status)) {
     throw new Error(`Invalid status: ${order.status}. Must be one of: ${validStatuses.join(", ")}`);
   }
 }
 
 function sanitizeOrderPayload(order) {
-  return {
+  const payload = {
     woo_order_id: Number(order.woo_order_id),
     order_number: String(order.order_number),
     status: order.status,
@@ -174,15 +175,27 @@ function sanitizeOrderPayload(order) {
     items: typeof order.items === "string" 
       ? order.items 
       : JSON.stringify(order.items || []),
-    created_at: order.created_at || new Date().toISOString(),
-    updated_at: order.updated_at || new Date().toISOString(),
+    
     discount_type: order.discount_type || null,
     discount_amount: Number(order.discount_amount) || 0,
     alteration_charge: Number(order.alteration_charge) || 0,
     courier_charge: Number(order.courier_charge) || 0,
     other_charge: Number(order.other_charge) || 0,
   };
+
+  // ✅ FIX: Use WooCommerce timestamps directly (preserves timezone)
+  // Only set timestamps if they exist
+  if (order.created_at) {
+    payload.created_at = order.created_at;
+  }
+  
+  if (order.updated_at) {
+    payload.updated_at = order.updated_at;
+  }
+
+  return payload;
 }
+
 
 /* =========================
    CUSTOMERS
@@ -374,19 +387,28 @@ function sanitizeCustomerPayload(customer) {
     postcode: billing.postcode || customer.postcode || "",
     country: billing.country || customer.country || "IN",
     customer_type: customerType,
-    updated_at: new Date().toISOString(),
   };
 
   if (customer.woo_customer_id || customer.id) {
     sanitized.woo_customer_id = Number(customer.woo_customer_id || customer.id);
   }
 
-  if (customer.created_at) {
-    sanitized.created_at = customer.created_at;
+  // ✅ FIX: Use WooCommerce GMT timestamps with 'Z' suffix
+  // This tells Baserow the timestamp is in UTC, so it can convert to user timezone
+  if (customer.date_created_gmt) {
+    sanitized.created_at = `${customer.date_created_gmt}Z`;
   } else if (customer.date_created) {
     sanitized.created_at = customer.date_created;
-  } else if (!customer.id && !customer.woo_customer_id) {
-    sanitized.created_at = new Date().toISOString();
+  }
+  
+  if (customer.date_modified_gmt) {
+    sanitized.updated_at = `${customer.date_modified_gmt}Z`;
+  } else if (customer.date_modified) {
+    sanitized.updated_at = customer.date_modified;
+  } else if (customer.date_created_gmt) {
+    sanitized.updated_at = `${customer.date_created_gmt}Z`;
+  } else if (customer.date_created) {
+    sanitized.updated_at = customer.date_created;
   }
 
   return sanitized;
