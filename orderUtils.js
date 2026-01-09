@@ -169,12 +169,29 @@ function getPaymentMethodTitle(method) {
   return titles[method] || "Cash Payment";
 }
 
+
 /**
- * Normalize WooCommerce order response for Baserow
- * ✅ Does NOT sync _hr_fms_components to Baserow
- * ✅ FIXED: Uses WooCommerce timestamps directly (preserves timezone)
+ * Check if order was created via POS
+ * This prevents WordPress-created orders from syncing to Baserow
  */
-export function normalizeOrderForBaserow(wooOrder) {
+export function isPosOrder(wooOrder) {
+  // ✅ CRITICAL: Check if order and meta_data exist
+  if (!wooOrder || !wooOrder.meta_data || !Array.isArray(wooOrder.meta_data)) {
+    console.log("[isPosOrder] No meta_data found, returning false");
+    return false;
+  }
+  
+  const posOrderMeta = wooOrder.meta_data.find(m => m.key === "_pos_order");
+  const result = posOrderMeta && posOrderMeta.value === "yes";
+  
+  console.log(`[isPosOrder] Order ${wooOrder.number}: ${result ? "POS" : "NOT POS"}`);
+  return result;
+} 
+   export function normalizeOrderForBaserow(wooOrder, skipPosCheck = false) {
+     if (!skipPosCheck && !isPosOrder(wooOrder)) {
+       return null; // Don't normalize non-POS orders
+     }
+
   // Extract coupon info
   const coupon = wooOrder.coupon_lines?.[0];
   const discountType = coupon 
@@ -207,32 +224,24 @@ export function normalizeOrderForBaserow(wooOrder) {
     customer_id: wooOrder.customer_id > 0 ? wooOrder.customer_id : null,
     notes: wooOrder.customer_note || "",
     measurements: getMeta("measurements") || "-",
-    items: JSON.stringify(normalizeLineItems(wooOrder.line_items)), // ✅ Clean items
+    items: JSON.stringify(normalizeLineItems(wooOrder.line_items)),
     
-    // ✅ FIXED: Use GMT timestamps with 'Z' suffix so Baserow knows it's UTC
-    // Baserow will then convert to user's timezone correctly
     created_at: wooOrder.date_created_gmt ? `${wooOrder.date_created_gmt}Z` : wooOrder.date_created,
     updated_at: wooOrder.date_modified_gmt 
       ? `${wooOrder.date_modified_gmt}Z` 
       : (wooOrder.date_created_gmt ? `${wooOrder.date_created_gmt}Z` : wooOrder.date_created),
     
-    // Discount fields
     discount_type: discountType,
     discount_amount: Number(wooOrder.discount_total || 0),
     
-    // Charge fields
     alteration_charge: getFee("Alteration Charges"),
     courier_charge: courierCharge,
     other_charge: getFee("Other Charges"),
     
-    // Order type
     order_type: getMeta("order_type") || "Normal Sale",
   };
 }
 
-/**
- * Map WooCommerce status to Baserow status
- */
 function mapStatus(wooStatus) {
   const STATUS_MAP = {
     "checkout-draft": "paid",
@@ -241,16 +250,12 @@ function mapStatus(wooStatus) {
     "on-hold": "paid",
     "completed": "completed",
     "cancelled": "cancelled",
-    "refunded": "refund",      // ✅ FIXED: Map to "refund" instead of "cancelled"
+    "refunded": "refund",
     "failed": "cancelled",
   };
   return STATUS_MAP[wooStatus] || "paid";
 }
 
-/**
- * Normalize line items - CLEAN VERSION without FMS components
- * ✅ Removes _hr_fms_components from Baserow sync
- */
 function normalizeLineItems(lineItems) {
   return lineItems.map(item => ({
     product_id: item.product_id,
@@ -262,6 +267,5 @@ function normalizeLineItems(lineItems) {
     subtotal: Number(item.subtotal),
     total: Number(item.total),
     tax: Number(item.total_tax || 0),
-    // ✅ DO NOT include meta_data (_hr_fms_components stays in WooCommerce only)
   }));
 }

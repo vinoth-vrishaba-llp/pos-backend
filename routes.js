@@ -440,20 +440,37 @@ router.get("/orders/:id", auth, async (req, res) => {
     // 1️⃣ Fetch from Baserow first (fast path)
     let order = await base.getOrderByWooId(wooOrderId);
 
-    // 2️⃣ If not found, fetch from WooCommerce and sync
+    // 2️⃣ If not found, fetch from WooCommerce
     if (!order) {
+      console.log(`Order ${wooOrderId} not in Baserow, fetching from WooCommerce...`);
+      
       const wooOrder = await woo.fetchOrder(wooOrderId);
-      order = normalizeOrderForBaserow(wooOrder);
-      await base.upsertOrder(order);
+      
+      // ✅ CHECK: Only normalize if it's a POS order
+      const normalized = normalizeOrderForBaserow(wooOrder);
+      
+      if (!normalized) {
+        return res.status(404).json({ 
+          message: "Order not found in POS system",
+          hint: "This order was created in WordPress, not via POS"
+        });
+      }
+      
+      // Sync to Baserow
+      const syncResult = await base.upsertOrder(normalized);
+      
+      if (syncResult.ok) {
+        order = syncResult.data;
+      } else {
+        // If sync failed, still return the normalized data
+        order = normalized;
+      }
     }
 
-    // 3️⃣ Parse items (stored as JSON string)
+    // 3️⃣ Parse items
     let items = [];
     try {
-      items =
-        typeof order.items === "string"
-          ? JSON.parse(order.items)
-          : order.items;
+      items = typeof order.items === "string" ? JSON.parse(order.items) : order.items;
     } catch {
       items = [];
     }
@@ -462,28 +479,18 @@ router.get("/orders/:id", auth, async (req, res) => {
       items = [];
     }
 
-    // 4️⃣ AUTHORITATIVE TOTALS (DO NOT RECALCULATE)
+    // 4️⃣ Calculate totals
     const discount = Number(order.discount_amount || 0);
-
     const charges = {
       alteration: Number(order.alteration_charge || 0),
       courier: Number(order.courier_charge || 0),
       other: Number(order.other_charge || 0),
     };
-
-    const chargesTotal =
-      charges.alteration + charges.courier + charges.other;
-
+    const chargesTotal = charges.alteration + charges.courier + charges.other;
     const tax = Number(order.tax_total || 0);
+    const subtotal = Number(order.total) + discount - chargesTotal - tax;
 
-    // Subtotal derived safely from Woo totals
-    const subtotal =
-      Number(order.total) +
-      discount -
-      chargesTotal -
-      tax;
-
-    // 5️⃣ FINAL RESPONSE (PRINT-SAFE)
+    // 5️⃣ Return response
     res.json({
       woo_order_id: order.woo_order_id,
       order_number: order.order_number,
@@ -513,12 +520,10 @@ router.get("/orders/:id", auth, async (req, res) => {
       },
 
       charges,
-
       discount_details: {
         type: order.discount_type || null,
         amount: discount,
       },
-
       order_type: order.order_type || "Normal Sale",
       measurements: order.measurements || "-",
       notes: order.notes || "",
@@ -531,7 +536,6 @@ router.get("/orders/:id", auth, async (req, res) => {
     });
   }
 });
-
 
 /* ==========================================
    MARK ORDER AS COMPLETED
@@ -585,6 +589,75 @@ router.patch("/orders/:id/complete", auth, async (req, res) => {
   }
 });
 
+
+/**
+ * Refund order endpoint
+ * PATCH /api/orders/:id/refund
+ */
+router.patch("/orders/:id/refund", auth, async (req, res) => {
+  const wooOrderId = req.params.id;
+
+  if (!wooOrderId || wooOrderId === "undefined") {
+    return res.status(400).json({ message: "Invalid order ID" });
+  }
+
+  try {
+    console.log(`\n💰 Processing refund for order ${wooOrderId}...`);
+
+    // 1️⃣ Check if exists in Baserow
+    const existing = await base.getOrderByWooId(wooOrderId);
+
+    if (!existing) {
+      return res.status(404).json({ message: "Order not found in POS system" });
+    }
+
+    // 2️⃣ Skip if already refunded
+    if (existing.status === "refund") {
+      console.log(`   ℹ️  Order already refunded`);
+      return res.json({ 
+        message: "Order already refunded", 
+        order: existing 
+      });
+    }
+
+    // 3️⃣ Skip if cancelled
+    if (existing.status === "cancelled") {
+      return res.status(400).json({ 
+        message: "Cannot refund a cancelled order" 
+      });
+    }
+
+    console.log(`   🔄 Updating WooCommerce status to refunded...`);
+
+    // 4️⃣ Update in WooCommerce
+    await woo.updateOrderStatus(wooOrderId, { status: "refunded" });
+
+    // 5️⃣ Add order note
+    woo.addOrderNote(
+      wooOrderId,
+      "Order refunded via POS"
+    ).catch(err => console.error("Failed to add note:", err));
+
+    console.log(`   💾 Updating Baserow status...`);
+
+    // 6️⃣ Update in Baserow
+    const updated = await base.patchOrderStatus(wooOrderId, "refunded");
+
+    console.log(`   ✅ Order refunded successfully\n`);
+
+    res.json({
+      message: "Order refunded successfully",
+      order: updated,
+    });
+
+  } catch (err) {
+    console.error("❌ Failed to refund order:", err);
+    res.status(500).json({ 
+      message: "Failed to refund order",
+      error: err.message,
+    });
+  }
+});
 
 /* ==========================================
    LIST ORDERS (PAGINATED)
@@ -1580,6 +1653,118 @@ router.delete("/coupons/:id", auth, async (req, res) => {
       success: false,
       message: "Failed to delete coupon",
       error: err.response?.data?.message || err.message,
+    });
+  }
+});
+
+/* ============================================
+WEBHOOK HANDLERS - WooCommerce → Baserow Sync
+============================================ */
+
+router.post("/webhooks/woocommerce", async (req, res) => {
+  try {
+    const event = req.headers["x-wc-webhook-event"];
+    const topic = req.headers["x-wc-webhook-topic"];
+    const signature = req.headers["x-wc-webhook-signature"];
+    
+    console.log("\n" + "=".repeat(70));
+    console.log("📬 WEBHOOK RECEIVED");
+    console.log("=".repeat(70));
+    console.log("Event:", event);
+    console.log("Topic:", topic);
+    console.log("Time:", new Date().toISOString());
+
+    // Verify webhook signature (optional but recommended)
+    /* 
+    if (process.env.WEBHOOK_SECRET) {
+      const crypto = require('crypto');
+      const hash = crypto
+        .createHmac('sha256', process.env.WEBHOOK_SECRET)
+        .update(JSON.stringify(req.body))
+        .digest('base64');
+      
+      if (hash !== signature) {
+        console.log("❌ Invalid webhook signature");
+        return res.status(401).json({ error: "Invalid signature" });
+      }
+    }
+    */
+
+    const wooOrder = req.body;
+
+    // Only process order events
+    if (!topic || !topic.startsWith("order.")) {
+      console.log("ℹ️  Not an order event - ignoring");
+      console.log("=".repeat(70) + "\n");
+      return res.json({ received: true, processed: false });
+    }
+
+    console.log("Order ID:", wooOrder.id);
+    console.log("Order Number:", wooOrder.number);
+    console.log("Status:", wooOrder.status);
+
+    // ✅ CHECK: Is this a POS order?
+    const hasPosFlag = wooOrder.meta_data?.some(m => m.key === "_pos_order" && m.value === "yes");
+    console.log("Has _pos_order flag:", hasPosFlag);
+
+    if (!hasPosFlag) {
+      console.log("⏭️  Not a POS order - skipping Baserow sync");
+      console.log("=".repeat(70) + "\n");
+      return res.json({ 
+        received: true, 
+        processed: false,
+        reason: "Not a POS order"
+      });
+    }
+
+    console.log("✅ POS order detected - syncing to Baserow...");
+
+    // Normalize order (skip POS check since we already verified)
+    const normalized = normalizeOrderForBaserow(wooOrder, true);
+
+    if (!normalized) {
+      console.log("❌ Failed to normalize order");
+      console.log("=".repeat(70) + "\n");
+      return res.json({ 
+        received: true, 
+        processed: false,
+        reason: "Normalization failed"
+      });
+    }
+
+    // Sync to Baserow
+    const result = await base.upsertOrder(normalized);
+
+    if (result.ok) {
+      console.log("✅ Order synced to Baserow");
+      console.log("Action:", result.action);
+      console.log("=".repeat(70) + "\n");
+      
+      return res.json({ 
+        received: true, 
+        processed: true,
+        action: result.action
+      });
+    } else {
+      console.log("❌ Failed to sync to Baserow");
+      console.log("=".repeat(70) + "\n");
+      
+      return res.status(500).json({ 
+        received: true, 
+        processed: false,
+        error: "Baserow sync failed"
+      });
+    }
+
+  } catch (err) {
+    console.error("❌ Webhook processing error:", err);
+    console.error("=".repeat(70) + "\n");
+    
+    // Still return 200 to prevent WooCommerce from retrying
+    return res.json({ 
+      received: true, 
+      processed: false,
+      error: err.message
     });
   }
 });

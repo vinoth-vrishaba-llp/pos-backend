@@ -1,32 +1,21 @@
-/**
- * Migration Script: Fix Existing Baserow Orders
- * 
- * This script:
- * 1. Fetches all orders from Baserow
- * 2. For each order, fetches fresh data from WooCommerce
- * 3. Re-normalizes with correct field mapping
- * 4. Updates Baserow with fixed data
- * 
- * Run with: node migrate-orders.js
- */
-
+// migrate-orders.js
 import "./env.js";
 import * as woo from "./woo.service.js";
 import * as base from "./baserow.service.js";
-import { normalizeOrderForBaserow } from "./orderUtils.js";
+import { normalizeOrderForBaserow, isPosOrder } from "./orderUtils.js"; // ✅ FIXED: Added isPosOrder import
 
 async function migrateOrders() {
   console.log("🚀 Starting Baserow order migration...\n");
 
   let migratedCount = 0;
   let failedCount = 0;
+  let skippedCount = 0;
   let page = 1;
   const limit = 50;
   let hasMore = true;
 
   while (hasMore) {
     try {
-      // Fetch orders from Baserow
       console.log(`📦 Fetching page ${page}...`);
       const { results, next } = await base.getOrders({ page, limit });
 
@@ -37,7 +26,6 @@ async function migrateOrders() {
 
       console.log(`   Found ${results.length} orders`);
 
-      // Process each order
       for (const baserowOrder of results) {
         try {
           const wooOrderId = baserowOrder.woo_order_id;
@@ -48,13 +36,26 @@ async function migrateOrders() {
             continue;
           }
 
-          // Fetch fresh data from WooCommerce
           console.log(`   🔄 Migrating order #${baserowOrder.order_number} (Woo ID: ${wooOrderId})`);
           
           const wooOrder = await woo.fetchOrder(wooOrderId);
 
-          // Re-normalize with correct mapping
-          const normalized = normalizeOrderForBaserow(wooOrder);
+          // ✅ CHECK: Skip non-POS orders during migration
+          if (!isPosOrder(wooOrder)) {
+            console.log(`   ⏭️  Skipping - not a POS order`);
+            skippedCount++;
+            await sleep(100);
+            continue;
+          }
+
+          // Re-normalize with correct mapping (skip POS check since we already checked)
+          const normalized = normalizeOrderForBaserow(wooOrder, true);
+
+          if (!normalized) {
+            console.log(`   ❌ Failed to normalize order`);
+            failedCount++;
+            continue;
+          }
 
           console.log(`   📅 Timestamps - Created: ${normalized.created_at}, Updated: ${normalized.updated_at}`);
 
@@ -69,7 +70,6 @@ async function migrateOrders() {
             failedCount++;
           }
 
-          // Rate limiting - wait 100ms between requests
           await sleep(100);
 
         } catch (err) {
@@ -78,7 +78,6 @@ async function migrateOrders() {
         }
       }
 
-      // Check if there are more pages
       hasMore = !!next;
       page++;
 
@@ -90,8 +89,9 @@ async function migrateOrders() {
 
   console.log("\n✨ Migration complete!");
   console.log(`   ✅ Migrated: ${migratedCount}`);
+  console.log(`   ⏭️  Skipped (non-POS): ${skippedCount}`);
   console.log(`   ❌ Failed: ${failedCount}`);
-  console.log(`   📊 Total: ${migratedCount + failedCount}`);
+  console.log(`   📊 Total: ${migratedCount + skippedCount + failedCount}`);
 }
 
 /**
@@ -111,8 +111,20 @@ async function fixSpecificOrders(wooOrderIds) {
       // Fetch from WooCommerce
       const wooOrder = await woo.fetchOrder(wooOrderId);
 
-      // Normalize
-      const normalized = normalizeOrderForBaserow(wooOrder);
+      // Check if POS order
+      if (!isPosOrder(wooOrder)) {
+        console.log(`   ⏭️  Skipping - not a POS order`);
+        continue;
+      }
+
+      // Normalize (skip POS check)
+      const normalized = normalizeOrderForBaserow(wooOrder, true);
+
+      if (!normalized) {
+        console.log(`   ❌ Failed to normalize`);
+        failedCount++;
+        continue;
+      }
 
       // Upsert to Baserow
       const result = await base.upsertOrder(normalized);
@@ -175,7 +187,7 @@ async function validateOrders() {
           issues.missing_woo_id.push(order.order_number);
         }
 
-        // Check status - ✅ UPDATED: Added "refund"
+        // Check status
         const validStatuses = ["paid", "completed", "cancelled", "refund"];
         if (!validStatuses.includes(order.status)) {
           issues.invalid_status.push({
@@ -197,7 +209,7 @@ async function validateOrders() {
           });
         }
 
-        // Check if charges exist but are 0
+        // Check if charges exist
         const hasChargeFields = 
           order.alteration_charge !== undefined &&
           order.courier_charge !== undefined &&
