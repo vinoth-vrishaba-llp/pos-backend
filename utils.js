@@ -3,6 +3,15 @@ export function normalizeProduct(p) {
   const fmsMeta = p.meta_data?.find(
     m => m.key === "_hr_fms_components"
   );
+  const getThumbnail = (product) => {
+    if (product.images?.[0]) {
+      // Try to get thumbnail size first
+      return product.images[0].sizes?.thumbnail || 
+             product.images[0].sizes?.medium || 
+             product.images[0].src;
+    }
+    return "";
+  };
 
   return {
     id: p.id,

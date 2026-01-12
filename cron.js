@@ -119,8 +119,8 @@ async function syncRecentCustomers() {
  * Start all cron jobs
  */
 export function startCronJobs() {
-  // Sync orders every 1 minute
-  cron.schedule("*/1 * * * *", syncRecentOrders);
+  // Sync orders every 5 minutes
+  cron.schedule("*/5 * * * *", syncRecentOrders);
 
   // Sync customers every 1 minute
   cron.schedule("*/1 * * * *", syncRecentCustomers);

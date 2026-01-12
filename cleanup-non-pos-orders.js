@@ -15,11 +15,11 @@ import * as base from "./baserow.service.js";
 import axios from "axios";
 
 async function cleanupNonPosOrders(dryRun = true) {
-  console.log("🧹 Starting cleanup of non-POS orders from Baserow...\n");
+  //console.log("🧹 Starting cleanup of non-POS orders from Baserow...\n");
   
   if (dryRun) {
-    console.log("⚠️  DRY RUN MODE - No deletions will be made");
-    console.log("   Set dryRun=false to actually delete orders\n");
+    //console.log("⚠️  DRY RUN MODE - No deletions will be made");
+    //console.log("   Set dryRun=false to actually delete orders\n");
   }
 
   let checkedCount = 0;

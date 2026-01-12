@@ -53,13 +53,97 @@ export async function fetchVariations(productId) {
 }
 
 export async function fetchProductsBySku(sku) {
-  const { data } = await woo.get("/products", {
-    params: {
-      sku,
-      per_page: 5,
-    },
+  console.log(`📥 WooCommerce API: Searching for SKU "${sku}"`);
+  
+  const skuTrimmed = sku.trim();
+  let allResults = [];
+  
+  // ✅ Strategy 1: Try exact SKU parameter first (fastest, most accurate)
+  console.log(`   → Strategy 1: Exact SKU parameter lookup...`);
+  try {
+    const exactResponse = await woo.get("/products", {
+      params: {
+        sku: skuTrimmed,
+        per_page: 10,
+        status: 'publish'
+      }
+    });
+    
+    if (exactResponse.data && exactResponse.data.length > 0) {
+      console.log(`   ✅ Found ${exactResponse.data.length} by exact SKU`);
+      allResults.push(...exactResponse.data);
+    } else {
+      console.log(`   ℹ️ No exact SKU match`);
+    }
+  } catch (e) {
+    console.log(`   ⚠️ Exact SKU lookup failed:`, e.message);
+  }
+  
+  // ✅ Strategy 2: Use search parameter for partial matches
+  console.log(`   → Strategy 2: Search parameter (partial match)...`);
+  try {
+    const searchResponse = await woo.get("/products", {
+      params: {
+        search: skuTrimmed,
+        per_page: 50,
+        status: 'publish'
+      }
+    });
+    
+    console.log(`   → Search returned ${searchResponse.data.length} products`);
+    
+    // Add results, avoiding duplicates
+    const existingIds = new Set(allResults.map(p => p.id));
+    searchResponse.data.forEach(p => {
+      if (!existingIds.has(p.id)) {
+        allResults.push(p);
+      }
+    });
+  } catch (e) {
+    console.log(`   ⚠️ Search lookup failed:`, e.message);
+  }
+  
+  console.log(`   → Combined results: ${allResults.length} products`);
+  
+  // ✅ Filter and sort results
+  const skuLower = skuTrimmed.toLowerCase();
+  
+  // Exact SKU matches
+  const exactMatches = allResults.filter(p => {
+    const productSku = (p.sku || "").toLowerCase().trim();
+    const isExact = productSku === skuLower;
+    if (isExact) {
+      console.log(`   ✅ EXACT: "${p.name}" (SKU: ${p.sku})`);
+    }
+    return isExact;
   });
-  return data;
+  
+  // Partial SKU matches (SKU starts with search term)
+  const partialSKUMatches = allResults.filter(p => {
+    const productSku = (p.sku || "").toLowerCase().trim();
+    const isPartial = productSku.includes(skuLower) && productSku !== skuLower;
+    if (isPartial) {
+      console.log(`   ✓ PARTIAL SKU: "${p.name}" (SKU: ${p.sku})`);
+    }
+    return isPartial;
+  });
+  
+  // Name matches (as fallback)
+  const nameMatches = allResults.filter(p => {
+    const productSku = (p.sku || "").toLowerCase().trim();
+    const productName = (p.name || "").toLowerCase();
+    const isNameMatch = !productSku.includes(skuLower) && productName.includes(skuLower);
+    if (isNameMatch) {
+      console.log(`   ℹ️ NAME: "${p.name}" (SKU: ${p.sku || "none"})`);
+    }
+    return isNameMatch;
+  });
+  
+  // Return sorted: exact first, then partial SKU, then name matches
+  const sorted = [...exactMatches, ...partialSKUMatches, ...nameMatches];
+  console.log(`   → Final results: ${sorted.length} products (${exactMatches.length} exact, ${partialSKUMatches.length} partial, ${nameMatches.length} name)`);
+  
+  return sorted;
 }
 
 export async function fetchCategories() {

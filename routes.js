@@ -4,7 +4,15 @@ import * as woo from "./woo.service.js";
 import * as base from "./baserow.service.js";
 import { normalizeProduct} from "./utils.js";
 import { buildWooOrderPayload, normalizeOrderForBaserow } from "./orderUtils.js";
-import { getCachedCategories, setCachedCategories } from "./cache.js";
+import { 
+  getCachedCategories, 
+  setCachedCategories,
+  getCachedVariations,
+  setCachedVariations,
+  clearCachedVariations,     // ✅ NEW
+  clearAllVariationsCache,   // ✅ NEW
+  getCacheStats,             // ✅ NEW
+} from "./cache.js";
 import {
   generateAccessToken,
   generateRefreshToken,
@@ -135,7 +143,7 @@ router.post("/auth/logout", (req, res) => {
 });
 
 
-/* PRODUCTS ENDPOINT - ENHANCED */
+/* PRODUCTS ENDPOINT - ENHANCED WITH CASE-INSENSITIVE SEARCH */
 router.get("/products", auth, async (req, res) => {
   const {
     page = 1,
@@ -146,27 +154,141 @@ router.get("/products", auth, async (req, res) => {
     per_page,
   } = req.query;
 
+  console.log("\n" + "=".repeat(70));
+  console.log("📦 PRODUCTS REQUEST");
+  console.log("=".repeat(70));
+  console.log("Type:", sku ? "SKU Lookup" : search ? "Search" : "Catalog");
+  console.log("Query:", sku || search || "-");
+  console.log("Category:", category || "all");
+  console.log("Page:", page);
+  console.log("Limit:", limit);
+
   try {
-    // 🔍 SKU / barcode lookup (POS scan)
+    // 🔍 SKU / barcode lookup (POS scan) - case-insensitive
     if (sku) {
+      console.log(`🔍 SKU Lookup: "${sku}"`);
       const products = await woo.fetchProductsBySku(sku);
+      
+      console.log(`   → WooCommerce returned ${products.length} products`);
+      
+      // ✅ FIX: More lenient filtering - match if SKU contains the query OR query contains the SKU
+      const skuLower = sku.toLowerCase().trim();
+      const filtered = products.filter(p => {
+        if (!p.sku) {
+          console.log(`   → Product "${p.name}": ❌ No SKU`);
+          return false;
+        }
+        
+        const productSku = p.sku.toLowerCase().trim();
+        
+        // Match if either:
+        // 1. Product SKU contains search query (e.g., "LF157" contains "lf")
+        // 2. Search query contains product SKU (exact match case)
+        // 3. They're equal
+        const matches = productSku.includes(skuLower) || 
+                       skuLower.includes(productSku) || 
+                       productSku === skuLower;
+        
+        console.log(`   → Product "${p.name}" (SKU: ${p.sku}): ${matches ? "✅ MATCH" : "❌ no match"}`);
+        console.log(`      Check: "${productSku}".includes("${skuLower}") = ${productSku.includes(skuLower)}`);
+        console.log(`      Check: "${skuLower}".includes("${productSku}") = ${skuLower.includes(productSku)}`);
+        
+        return matches;
+      });
+      
+      console.log(`   ✅ Filtered to ${filtered.length} matching products`);
+      console.log("=".repeat(70) + "\n");
+      
       return res.json({
-        data: products.map(normalizeProduct),
+        data: filtered.map(normalizeProduct),
       });
     }
 
     // 🔍 SEARCH mode (search across all products)
     if (search) {
       const searchLimit = per_page || 100;
-      const products = await woo.fetchProducts({ 
-        page: 1, 
-        limit: searchLimit, 
-        category,
-        search: search.trim(),
+      const searchLower = search.trim().toLowerCase();
+      
+      console.log(`🔍 Search: "${search}" (limit: ${searchLimit})`);
+      
+      // ✅ Try multiple search strategies
+      let products = [];
+      
+      // Strategy 1: Try exact SKU match first (using sku parameter)
+      console.log(`   → Strategy 1: Trying exact SKU match...`);
+      try {
+        const skuResults = await woo.get("/products", {
+          params: {
+            sku: search.trim(),
+            per_page: 10,
+            status: 'publish'
+          }
+        });
+        
+        if (skuResults.data && skuResults.data.length > 0) {
+          console.log(`   ✅ Found ${skuResults.data.length} by exact SKU parameter`);
+          products = skuResults.data;
+        }
+      } catch (e) {
+        console.log(`   ⚠️ Exact SKU match failed:`, e.message);
+      }
+      
+      // Strategy 2: If no exact match, use search parameter
+      if (products.length === 0) {
+        console.log(`   → Strategy 2: Trying search parameter...`);
+        products = await woo.fetchProducts({ 
+          page: 1, 
+          limit: searchLimit, 
+          category,
+          search: search.trim(),
+        });
+        console.log(`   → Search returned ${products.length} products`);
+      }
+      
+      // ✅ Filter results (case-insensitive, check both name and SKU)
+      const filtered = products.filter(p => {
+        const nameLower = (p.name || "").toLowerCase();
+        const skuLower = (p.sku || "").toLowerCase();
+        
+        // Match if search term appears in name OR SKU (partial match)
+        const matchesName = nameLower.includes(searchLower);
+        const matchesSku = skuLower.includes(searchLower);
+        // Also check reverse (for exact matches)
+        const exactSku = skuLower === searchLower;
+        
+        if (matchesSku || matchesName || exactSku) {
+          const matchType = exactSku ? "EXACT SKU" : matchesSku ? "SKU" : "NAME";
+          console.log(`   ✅ "${p.name}" (SKU: ${p.sku}) - matched by ${matchType}`);
+          return true;
+        }
+        return false;
       });
       
+      // ✅ Sort results: exact SKU match first, then partial SKU, then name
+      const sorted = filtered.sort((a, b) => {
+        const aSkuLower = (a.sku || "").toLowerCase();
+        const bSkuLower = (b.sku || "").toLowerCase();
+        
+        const aExact = aSkuLower === searchLower;
+        const bExact = bSkuLower === searchLower;
+        
+        if (aExact && !bExact) return -1;
+        if (!aExact && bExact) return 1;
+        
+        const aPartialSku = aSkuLower.includes(searchLower);
+        const bPartialSku = bSkuLower.includes(searchLower);
+        
+        if (aPartialSku && !bPartialSku) return -1;
+        if (!aPartialSku && bPartialSku) return 1;
+        
+        return 0;
+      });
+      
+      console.log(`   ✅ Filtered to ${sorted.length} matching products`);
+      console.log("=".repeat(70) + "\n");
+      
       return res.json({
-        data: products.map(normalizeProduct),
+        data: sorted.map(normalizeProduct),
         meta: {
           page: 1,
           limit: searchLimit,
@@ -176,7 +298,11 @@ router.get("/products", auth, async (req, res) => {
     }
 
     // 📦 Normal paginated catalog
+    console.log(`📦 Catalog fetch (page ${page}, limit ${limit})`);
     const products = await woo.fetchProducts({ page, limit, category });
+    
+    console.log(`   ✅ Fetched ${products.length} products`);
+    console.log("=".repeat(70) + "\n");
     
     res.json({
       data: products.map(normalizeProduct),
@@ -188,14 +314,13 @@ router.get("/products", auth, async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Failed to fetch products:", err);
+    console.error("=".repeat(70) + "\n");
     res.status(500).json({ 
       message: "Failed to fetch products",
       error: err.message,
     });
   }
 });
-
-
 router.get("/products/:id", auth, async (req, res) => {
   const product = await woo.fetchProductById(req.params.id);
   res.json(normalizeProduct(product));
@@ -212,25 +337,81 @@ router.get("/categories", auth, async (_, res) => {
   res.json(categories);
 });
 
+/* ==========================================
+   PRODUCT VARIATIONS - WITH CACHING
+   ✅ Caches variations for 5 minutes to reduce WooCommerce API calls
+========================================== */
 router.get("/products/:id/variations", auth, async (req, res) => {
-  const variations = await woo.fetchVariations(req.params.id);
+  const productId = req.params.id;
+  const startTime = Date.now();
 
-  const normalized = variations.map(v => ({
-    id: v.id,
-    sku: v.sku,
-    price: Number(v.price),
-    stock_quantity: v.stock_quantity ?? 0,
-    stock_status: v.stock_status,
-    size: v.attributes.find(a => a.name === "Size")?.option,
-  }));
+  try {
+    console.log(`\n📦 Variations request for product ${productId}`);
 
-  res.json(normalized);
+    // ✅ STEP 1: Check cache first
+    const cached = getCachedVariations(productId);
+    
+    if (cached) {
+      const duration = Date.now() - startTime;
+      console.log(`⚡ Served from cache in ${duration}ms`);
+      
+      // Normalize cached data
+      const normalized = cached.map(v => ({
+        id: v.id,
+        sku: v.sku,
+        price: Number(v.price),
+        stock_quantity: v.stock_quantity ?? 0,
+        stock_status: v.stock_status,
+        size: v.attributes.find(a => a.name === "Size")?.option,
+        attributes: v.attributes, // ✅ Keep full attributes
+      }));
+      
+      return res.json(normalized);
+    }
+
+    // ✅ STEP 2: Cache miss - fetch from WooCommerce
+    console.log(`📡 Cache MISS - fetching from WooCommerce...`);
+    const variations = await woo.fetchVariations(productId);
+    
+    const duration = Date.now() - startTime;
+    console.log(`✅ Fetched ${variations.length} variations in ${duration}ms`);
+    
+    // ✅ Log if slow
+    if (duration > 1000) {
+      console.warn(`⚠️ SLOW: WooCommerce took ${duration}ms for product ${productId}`);
+    }
+
+    // ✅ STEP 3: Store in cache
+    setCachedVariations(productId, variations);
+
+    // ✅ STEP 4: Normalize and return
+    const normalized = variations.map(v => ({
+      id: v.id,
+      sku: v.sku,
+      price: Number(v.price),
+      stock_quantity: v.stock_quantity ?? 0,
+      stock_status: v.stock_status,
+      size: v.attributes.find(a => a.name === "Size")?.option,
+      attributes: v.attributes, // ✅ Keep full attributes
+    }));
+
+    res.json(normalized);
+    
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    console.error(`❌ Failed to fetch variations after ${duration}ms:`, err.message);
+    res.status(500).json({ 
+      message: "Failed to fetch variations",
+      error: err.message,
+    });
+  }
 });
 
 
 
 /* ==========================================
-   CREATE ORDER - WITH FMS COMPONENTS LOGGING
+   CREATE ORDER - WITH FMS COMPONENTS LOGGING AND ORDER PREFIX
+   ✅ UPDATED: Now returns prefixed order number
 ========================================== */
 router.post("/orders", auth, async (req, res) => {
   try {
@@ -290,6 +471,7 @@ router.post("/orders", auth, async (req, res) => {
 
     console.log("\n📤 WOOCOMMERCE PAYLOAD PREPARED:");
     console.log("   Line Items:", wooPayload.line_items.length);
+    console.log("   Order Prefix:", wooPayload.meta_data.find(m => m.key === "_pos_order_prefix")?.value || "N/A");
     
     // Check if meta_data was added to line items
     wooPayload.line_items.forEach((item, idx) => {
@@ -312,7 +494,7 @@ router.post("/orders", auth, async (req, res) => {
 
     console.log("✅ WOOCOMMERCE ORDER CREATED:");
     console.log("   Order ID:", wooOrder.id);
-    console.log("   Order Number:", wooOrder.number);
+    console.log("   Order Number (WooCommerce):", wooOrder.number);
     console.log("   Total:", wooOrder.total);
     console.log("   Status:", wooOrder.status);
 
@@ -342,8 +524,13 @@ router.post("/orders", auth, async (req, res) => {
       console.log(`   Order link: ${process.env.WOO_BASE_URL}/wp-admin/post.php?post=${wooOrder.id}&action=edit`);
     }
 
-    // 3️⃣ Normalize for Baserow
+    // 3️⃣ Normalize for Baserow (includes prefix)
     const normalized = normalizeOrderForBaserow(wooOrder);
+
+    // ✅ Extract prefixed order number
+    const displayNumber = normalized.order_number; // Already prefixed from normalizeOrderForBaserow
+    
+    console.log("   Order Number (Display):", displayNumber);
 
     // 4️⃣ Sync to Baserow (best effort)
     const baserowResult = await base.upsertOrder(normalized);
@@ -351,13 +538,13 @@ router.post("/orders", auth, async (req, res) => {
     console.log("\n📊 BASEROW SYNC:", baserowResult.ok ? "Success" : "Failed");
     console.log("=".repeat(70) + "\n");
 
-    // 5️⃣ Return full status
+    // 5️⃣ Return full status with prefixed order number
     res.status(201).json({
       success: true,
       woo: {
         ok: true,
         order_id: wooOrder.id,
-        order_number: wooOrder.number,
+        order_number: displayNumber, // ✅ Use prefixed number (e.g., "POS-1234")
         total: wooOrder.total,
         discount_total: wooOrder.discount_total,
         fms_items: fmsItemCount,
@@ -1016,18 +1203,34 @@ router.post("/customers", auth, async (req, res) => {
       return res.status(400).json({ message: "First name is required" });
     }
 
-    if (!phone?.trim()) {
-      return res.status(400).json({ message: "Phone is required" });
+    // At least one contact method required
+    if (!phone?.trim() && !email?.trim()) {
+      return res.status(400).json({ 
+        message: "At least one contact method (phone or email) is required" 
+      });
     }
 
-    // ✅ Check for duplicate phone in Baserow
-    const existingByPhone = await base.findCustomerByPhone(phone.trim());
-    if (existingByPhone) {
-      console.log("⚠️ Customer with this phone already exists:", existingByPhone.id);
-      return res.status(409).json({ 
-        message: "Customer with this phone number already exists",
-        customer: existingByPhone,
-      });
+   // ✅ Check for duplicates in Baserow
+    if (phone?.trim()) {
+      const existingByPhone = await base.findCustomerByPhone(phone.trim());
+      if (existingByPhone) {
+        console.log("⚠️ Customer with this phone already exists:", existingByPhone.id);
+        return res.status(409).json({ 
+          message: "Customer with this phone number already exists",
+          customer: existingByPhone,
+        });
+      }
+    }
+    
+    if (email?.trim()) {
+      const existingByEmail = await base.findCustomerByEmail(email.trim());
+      if (existingByEmail) {
+        console.log("⚠️ Customer with this email already exists:", existingByEmail.id);
+        return res.status(409).json({ 
+          message: "Customer with this email already exists",
+          customer: existingByEmail,
+        });
+      }
     }
 
     console.log("\n" + "=".repeat(70));
@@ -1038,12 +1241,12 @@ router.post("/customers", auth, async (req, res) => {
     const wooPayload = {
       first_name: first_name.trim(),
       last_name: (last_name || "").trim(),
-      username: `customer_${phone.trim()}`,
+      username: `customer_${phone?.trim() || email?.trim().replace(/[@.]/g, '_')}_${Date.now()}`,
       password: generateSecurePassword(),
       billing: {
         first_name: first_name.trim(),
         last_name: (last_name || "").trim(),
-        phone: phone.trim(),
+        phone: (phone || "").trim(),
         address_1: billing?.address_1 || "",
         address_2: billing?.address_2 || "",
         city: billing?.city || "",
@@ -1769,4 +1972,51 @@ router.post("/webhooks/woocommerce", async (req, res) => {
   }
 });
 
+/* ==========================================
+   CACHE MANAGEMENT ENDPOINTS
+   ✅ For debugging and manual cache control
+========================================== */
+
+/**
+ * Get cache statistics
+ * GET /api/cache/stats
+ */
+router.get("/cache/stats", auth, (req, res) => {
+  const stats = getCacheStats();
+  res.json({
+    success: true,
+    cache: stats,
+  });
+});
+
+/**
+ * Clear variations cache for a specific product
+ * DELETE /api/cache/variations/:productId
+ */
+router.delete("/cache/variations/:productId", auth, (req, res) => {
+  const { productId } = req.params;
+  const cleared = clearCachedVariations(productId);
+  
+  res.json({
+    success: true,
+    message: cleared 
+      ? `Cache cleared for product ${productId}` 
+      : `No cache found for product ${productId}`,
+    cleared,
+  });
+});
+
+/**
+ * Clear ALL variations cache
+ * DELETE /api/cache/variations
+ */
+router.delete("/cache/variations", auth, (req, res) => {
+  const count = clearAllVariationsCache();
+  
+  res.json({
+    success: true,
+    message: `Cleared cache for ${count} products`,
+    count,
+  });
+});
 export default router;

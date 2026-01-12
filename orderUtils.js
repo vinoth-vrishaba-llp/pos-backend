@@ -3,6 +3,7 @@
 /**
  * Build WooCommerce Order Payload from POS Cart
  * ✅ UPDATED: Properly formats FMS components to match WordPress plugin expectations
+ * ✅ UPDATED: Adds ORDER_PREFIX to meta_data for POS order identification
  * ✅ FIXED: Removed created_at to let WooCommerce handle timestamps
  */
 export function buildWooOrderPayload(cartData) {
@@ -131,6 +132,11 @@ export function buildWooOrderPayload(cartData) {
       key: "_pos_order",
       value: "yes",
     },
+    // ✅ NEW: Add order prefix for POS identification
+    {
+      key: "_pos_order_prefix",
+      value: process.env.ORDER_PREFIX || "POS-",
+    },
   ];
 
   // 7️⃣ Assemble final payload
@@ -148,7 +154,6 @@ export function buildWooOrderPayload(cartData) {
     shipping_lines,
     customer_note: notes || "",
     meta_data,
-    // ❌ REMOVED: created_at - WooCommerce handles this automatically with correct timezone
   };
 
   return payload;
@@ -169,6 +174,21 @@ function getPaymentMethodTitle(method) {
   return titles[method] || "Cash Payment";
 }
 
+/**
+ * ✅ NEW: Get display order number with prefix
+ * Extracts prefix from meta_data and applies it to order number
+ */
+function getDisplayOrderNumber(wooOrder) {
+  const orderNumber = String(wooOrder.number);
+  const prefix = wooOrder.meta_data?.find(m => m.key === "_pos_order_prefix")?.value;
+  
+  // If prefix exists and number doesn't already have it, add it
+  if (prefix && !orderNumber.startsWith(prefix)) {
+    return `${prefix}${orderNumber}`;
+  }
+  
+  return orderNumber;
+}
 
 /**
  * Check if order was created via POS
@@ -186,11 +206,16 @@ export function isPosOrder(wooOrder) {
   
   console.log(`[isPosOrder] Order ${wooOrder.number}: ${result ? "POS" : "NOT POS"}`);
   return result;
-} 
-   export function normalizeOrderForBaserow(wooOrder, skipPosCheck = false) {
-     if (!skipPosCheck && !isPosOrder(wooOrder)) {
-       return null; // Don't normalize non-POS orders
-     }
+}
+
+/**
+ * Normalize WooCommerce order for Baserow storage
+ * ✅ UPDATED: Now includes prefixed order number
+ */
+export function normalizeOrderForBaserow(wooOrder, skipPosCheck = false) {
+  if (!skipPosCheck && !isPosOrder(wooOrder)) {
+    return null; // Don't normalize non-POS orders
+  }
 
   // Extract coupon info
   const coupon = wooOrder.coupon_lines?.[0];
@@ -217,7 +242,7 @@ export function isPosOrder(wooOrder) {
 
   return {
     woo_order_id: wooOrder.id,
-    order_number: String(wooOrder.number),
+    order_number: getDisplayOrderNumber(wooOrder), // ✅ UPDATED: Now includes prefix
     status: mapStatus(wooOrder.status),
     total: Number(wooOrder.total),
     payment_method: wooOrder.payment_method || "unknown",

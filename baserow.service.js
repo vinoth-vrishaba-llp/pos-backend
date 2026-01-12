@@ -264,6 +264,11 @@ export async function getCustomerByWooId(wooCustomerId) {
 
 export async function findCustomerByPhone(phone) {
   try {
+    // If no phone provided, skip search
+    if (!phone || !phone.trim()) {
+      return null;
+    }
+    
     const { data } = await base.get(
       `/database/rows/table/${process.env.BASEROW_CUSTOMERS_TABLE_ID}/`,
       {
@@ -277,6 +282,32 @@ export async function findCustomerByPhone(phone) {
   } catch (err) {
     console.error("[BASEROW FIND CUSTOMER BY PHONE FAILED]", {
       phone,
+      error: err.response?.data || err.message,
+    });
+    return null;
+  }
+}
+
+export async function findCustomerByEmail(email) {
+  try {
+    // If no email provided, skip search
+    if (!email || !email.trim()) {
+      return null;
+    }
+    
+    const { data } = await base.get(
+      `/database/rows/table/${process.env.BASEROW_CUSTOMERS_TABLE_ID}/`,
+      {
+        params: {
+          filter__email__equal: email.trim(),
+          user_field_names: true,
+        },
+      }
+    );
+    return data.results?.[0] || null;
+  } catch (err) {
+    console.error("[BASEROW FIND CUSTOMER BY EMAIL FAILED]", {
+      email,
       error: err.response?.data || err.message,
     });
     return null;
